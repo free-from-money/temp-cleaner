@@ -1,12 +1,46 @@
 package tempcleaner
 
 import (
+	"embed"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
 )
+
+var (
+	//go:embed build/*
+	buildFS embed.FS
+
+	defaultBinaryPath string
+	initErr           error
+)
+
+func init() {
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	binName := fmt.Sprintf("temp-cleaner-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
+
+	// Unpack from embedded filesystem
+	binData, err := buildFS.ReadFile("build/" + binName)
+	if err != nil {
+		initErr = fmt.Errorf("embedded binary not found for %s/%s: %w", runtime.GOOS, runtime.GOARCH, err)
+		return
+	}
+
+	// Write it to the temporary directory
+	tmpPath := filepath.Join(os.TempDir(), binName)
+	if err := os.WriteFile(tmpPath, binData, 0755); err != nil {
+		initErr = fmt.Errorf("failed to write binary to temp dir: %w", err)
+		return
+	}
+
+	defaultBinaryPath = tmpPath
+}
 
 // CleanOptions holds the configuration for launching the cleaner binary.
 type CleanOptions struct {
@@ -25,12 +59,13 @@ type CleanOptions struct {
 // The spawned process will survive even if the parent process exits.
 func StartDetached(opts CleanOptions) (int, error) {
 	if opts.BinaryPath == "" {
-		// Auto-resolve binary path based on runtime OS and Arch
-		ext := ""
-		if runtime.GOOS == "windows" {
-			ext = ".exe"
+		if initErr != nil {
+			return 0, fmt.Errorf("default binary initialization failed: %w", initErr)
 		}
-		opts.BinaryPath = filepath.Join("build", fmt.Sprintf("temp-cleaner-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext))
+		if defaultBinaryPath == "" {
+			return 0, fmt.Errorf("BinaryPath is required and default embedded binary is not available")
+		}
+		opts.BinaryPath = defaultBinaryPath
 	}
 	if opts.TargetDir == "" {
 		return 0, fmt.Errorf("TargetDir is required")
