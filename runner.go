@@ -34,9 +34,11 @@ func init() {
 
 	// Write it to the temporary directory
 	tmpPath := filepath.Join(os.TempDir(), binName)
-	if err := os.WriteFile(tmpPath, binData, 0755); err != nil {
-		initErr = fmt.Errorf("failed to write binary to temp dir: %w", err)
-		return
+	if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
+		if err := os.WriteFile(tmpPath, binData, 0755); err != nil {
+			initErr = fmt.Errorf("failed to write binary to temp dir: %w", err)
+			return
+		}
 	}
 
 	defaultBinaryPath = tmpPath
