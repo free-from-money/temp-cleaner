@@ -4,41 +4,63 @@ package checker
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
-// osIsInUse checks if a directory is in use on Windows.
-// A common way to check if a directory is in use on Windows is to try renaming it
-// to its own name or a temporary name.
+// osIsInUse checks whether anything under path is held open by another process.
+//
+// Every entry in the tree is opened with dwShareMode=0, which asks Windows for
+// exclusive access. If some other process already holds the entry open, the
+// open fails with ERROR_SHARING_VIOLATION, and that is exactly the condition
+// that would make deleting it fail too. Nothing under path is modified.
 func osIsInUse(ctx context.Context, path string) (bool, error) {
-	// Attempt to rename the directory to a temporary name and back.
-	// If a file inside is open, Windows will typically block the directory rename with an access denied error.
-	
-	// A less invasive check is to try opening the directory with exclusive access,
-	// but directories in Windows don't behave exactly like files for exclusive locking.
-	// Let's use the rename trick, but rename it to a temp name in the same parent.
-	
-	parent := filepath.Dir(path)
-	base := filepath.Base(path)
-	tempName := filepath.Join(parent, base+"_check_tmp")
+	inUse := false
 
-	err := os.Rename(path, tempName)
-	if err != nil {
-		// If we get an error, it might be access denied due to being in use.
-		// os.IsPermission or check for specific syscall errors.
-		// For simplicity, any error during rename (when it exists) we treat as in use.
-		if os.IsNotExist(err) {
-			return false, nil
+	err := filepath.WalkDir(path, func(name string, _ fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		return true, nil
+		if walkErr != nil {
+			// Gone (including the top-level path never existing): nothing to hold.
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			// Cannot even list it, so we cannot delete it.
+			inUse = true
+			return filepath.SkipAll
+		}
+		if locked(name) {
+			inUse = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
+	return inUse, nil
+}
 
-	// Rename it back immediately
-	if err := os.Rename(tempName, path); err != nil {
-		return false, fmt.Errorf("directory was renamed but failed to rename back: %w", err)
+// locked reports whether name cannot be opened exclusively.
+// FILE_FLAG_BACKUP_SEMANTICS is required to get a handle to a directory at all,
+// and is what catches a process holding the directory as its working directory.
+func locked(name string) bool {
+	p, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return true
 	}
-
-	return false, nil
+	h, err := syscall.CreateFile(p, syscall.GENERIC_READ, 0, nil,
+		syscall.OPEN_EXISTING, syscall.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		// Vanished mid-walk: not in use. Anything else (sharing violation,
+		// access denied) means we could not delete it either, so say in use.
+		return !errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) &&
+			!errors.Is(err, syscall.ERROR_PATH_NOT_FOUND)
+	}
+	syscall.CloseHandle(h)
+	return false
 }
