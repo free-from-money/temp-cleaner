@@ -1,48 +1,76 @@
 package tempcleaner
 
 import (
-	"embed"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 )
 
-var (
-	//go:embed build/*
-	buildFS embed.FS
+// unpackBinary decompresses the embedded cleaner binary into the temp directory.
+// It runs at most once per process, and only when StartDetached actually needs it.
+// The file name carries a hash of the embedded data, so a new library version
+// never reuses a stale binary left behind in the temp directory.
+var unpackBinary = sync.OnceValues(func() (string, error) {
+	if len(binGz) == 0 {
+		return "", fmt.Errorf("embedded binary not found for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
 
-	defaultBinaryPath string
-	initErr           error
-)
-
-func init() {
 	ext := ""
 	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
-	binName := fmt.Sprintf("temp-cleaner-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
-
-	// Unpack from embedded filesystem
-	binData, err := buildFS.ReadFile("build/" + binName)
-	if err != nil {
-		initErr = fmt.Errorf("embedded binary not found for %s/%s: %w", runtime.GOOS, runtime.GOARCH, err)
-		return
-	}
-
-	// Write it to the temporary directory
+	sum := sha256.Sum256(binGz)
+	binName := fmt.Sprintf("temp-cleaner-%s-%s-%s%s", runtime.GOOS, runtime.GOARCH, hex.EncodeToString(sum[:4]), ext)
 	tmpPath := filepath.Join(os.TempDir(), binName)
-	if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
-		if err := os.WriteFile(tmpPath, binData, 0755); err != nil {
-			initErr = fmt.Errorf("failed to write binary to temp dir: %w", err)
-			return
-		}
+
+	if _, err := os.Stat(tmpPath); err == nil {
+		return tmpPath, nil
 	}
 
-	defaultBinaryPath = tmpPath
-}
+	zr, err := gzip.NewReader(bytes.NewReader(binGz))
+	if err != nil {
+		return "", fmt.Errorf("failed to decompress embedded binary: %w", err)
+	}
+	defer zr.Close()
+
+	binData, err := io.ReadAll(zr)
+	if err != nil {
+		return "", fmt.Errorf("failed to decompress embedded binary: %w", err)
+	}
+
+	// Write to a sibling temp file and rename, so a concurrent process never
+	// execs a half-written binary.
+	f, err := os.CreateTemp(filepath.Dir(tmpPath), binName+".*")
+	if err != nil {
+		return "", fmt.Errorf("failed to write binary to temp dir: %w", err)
+	}
+	defer os.Remove(f.Name())
+
+	if _, err := f.Write(binData); err != nil {
+		f.Close()
+		return "", fmt.Errorf("failed to write binary to temp dir: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("failed to write binary to temp dir: %w", err)
+	}
+	if err := os.Chmod(f.Name(), 0755); err != nil {
+		return "", fmt.Errorf("failed to write binary to temp dir: %w", err)
+	}
+	if err := os.Rename(f.Name(), tmpPath); err != nil {
+		return "", fmt.Errorf("failed to write binary to temp dir: %w", err)
+	}
+
+	return tmpPath, nil
+})
 
 // CleanOptions holds the configuration for launching the cleaner binary.
 type CleanOptions struct {
@@ -61,13 +89,11 @@ type CleanOptions struct {
 // The spawned process will survive even if the parent process exits.
 func StartDetached(opts CleanOptions) (int, error) {
 	if opts.BinaryPath == "" {
-		if initErr != nil {
-			return 0, fmt.Errorf("default binary initialization failed: %w", initErr)
+		path, err := unpackBinary()
+		if err != nil {
+			return 0, fmt.Errorf("default binary initialization failed: %w", err)
 		}
-		if defaultBinaryPath == "" {
-			return 0, fmt.Errorf("BinaryPath is required and default embedded binary is not available")
-		}
-		opts.BinaryPath = defaultBinaryPath
+		opts.BinaryPath = path
 	}
 	if opts.TargetDir == "" {
 		return 0, fmt.Errorf("TargetDir is required")
